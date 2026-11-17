@@ -30,7 +30,7 @@ from openai import AsyncOpenAI
 #   ADMIN_ID    — твой Telegram ID (число)
 # Необязательно: PAYMENT_DETAILS, AI_MODEL, AI_BASE_URL, DB_PATH
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("API_TOKEN", "")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.groq.com/openai/v1")
