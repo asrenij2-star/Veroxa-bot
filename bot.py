@@ -1,5 +1,5 @@
+
 import asyncio
-import os
 import time
 import sqlite3
 import logging
@@ -13,7 +13,7 @@ from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    InlineKeyboardButton
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -22,28 +22,23 @@ from openai import AsyncOpenAI
 
 
 # ==================================
-# НАСТРОЙКИ (из переменных окружения)
+# VEXORA AI — НАСТРОЙКИ
 # ==================================
-# На Bothost добавь в "Переменные окружения":
-#   BOT_TOKEN   — токен от @BotFather
-#   AI_API_KEY  — ключ Groq
-#   ADMIN_ID    — твой Telegram ID (число)
-# Необязательно: PAYMENT_DETAILS, AI_MODEL, AI_BASE_URL, DB_PATH
+ADMIN_ID = 8939059429
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN") or os.environ.get("API_TOKEN", "")
-AI_API_KEY = os.environ.get("AI_API_KEY", "")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://api.groq.com/openai/v1")
-AI_MODEL = os.environ.get("AI_MODEL", "openai/gpt-oss-120b")
-PAYMENT_DETAILS = os.environ.get("PAYMENT_DETAILS", "Реквизиты для оплаты")
-DB_PATH = os.environ.get("DB_PATH", "vexora.db")
+AI_BASE_URL = "https://api.groq.com/openai/v1"
+AI_MODEL = "openai/gpt-oss-120b"
 
-if not BOT_TOKEN:
-    raise ValueError("Не задана переменная окружения BOT_TOKEN")
-if not AI_API_KEY:
-    raise ValueError("Не задана переменная окружения AI_API_KEY")
-if not ADMIN_ID:
-    raise ValueError("Не задана переменная окружения ADMIN_ID")
+PAYMENT_DETAILS = "Реквизиты для оплаты"
+
+TRIAL_SECONDS = 24 * 60 * 60
+
+
+if BOT_TOKEN.startswith("ВСТАВЬ_"):
+    raise ValueError("Вставь Telegram-токен!")
+
+if AI_API_KEY.startswith("ВСТАВЬ_"):
+    raise ValueError("Вставь Groq API-ключ!")
 
 
 # ==================================
@@ -52,24 +47,29 @@ if not ADMIN_ID:
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML
+    )
 )
 
 dp = Dispatcher()
 
-ai = AsyncOpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL)
+ai = AsyncOpenAI(
+    api_key=AI_API_KEY,
+    base_url=AI_BASE_URL
+)
 
 
 # ==================================
 # БАЗА ДАННЫХ
 # ==================================
 
-DB = sqlite3.connect(DB_PATH)
+DB = sqlite3.connect("vexora.db")
 DB.row_factory = sqlite3.Row
 
 DB.execute("""
@@ -92,14 +92,47 @@ CREATE TABLE IF NOT EXISTS payments (
 )
 """)
 
+# Тикеты поддержки
+
+DB.execute("""
+CREATE TABLE IF NOT EXISTS support_tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at INTEGER NOT NULL,
+    closed_at INTEGER DEFAULT NULL
+)
+""")
+
+# Сообщения внутри тикетов
+
+DB.execute("""
+CREATE TABLE IF NOT EXISTS support_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL,
+    sender_id INTEGER NOT NULL,
+    sender_type TEXT NOT NULL,
+    message TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+)
+""")
+
+# Баны поддержки
+
+DB.execute("""
+CREATE TABLE IF NOT EXISTS support_bans (
+    user_id INTEGER PRIMARY KEY,
+    expires_at INTEGER NOT NULL,
+    reason TEXT DEFAULT ''
+)
+""")
+
 DB.commit()
 
 
 # ==================================
-# ТАРИФЫ
+# ТАРИФЫ И СОСТОЯНИЯ
 # ==================================
-
-TRIAL_SECONDS = 24 * 60 * 60
 
 PLANS = {
     "1": ("1 месяц", 50, 30),
@@ -115,42 +148,36 @@ chat_history = {}
 selected_plan = {}
 user_modes = {}
 
-
-# ==================================
-# МЕНЮ
-# ==================================
-
-def menu():
-    def btn(text, data):
-        return [InlineKeyboardButton(text=text, callback_data=data)]
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            btn("💬 Общение с ИИ", "chat"),
-            btn("🧠 Ответ на оскорбление", "smart"),
-            btn("🖼 Генерация фото", "photo"),
-            btn("🎬 Генерация видео", "video"),
-            btn("✨ Редактор фото/видео", "editor"),
-            btn("🎙 Генерация голоса", "voice"),
-            btn("💎 Купить подписку", "buy"),
-            btn("👤 Мой профиль", "profile"),
-        ]
-    )
+# Режимы переписки с поддержкой
+support_modes = {}
 
 
 # ==================================
-# ПОЛЬЗОВАТЕЛИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==================================
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+def ticket_number(ticket_id):
+    return f"{ticket_id:03d}"
+
 
 def ensure_user(user_id):
+
     row = DB.execute(
-        "SELECT user_id FROM users WHERE user_id=?", (user_id,)
+        "SELECT user_id FROM users WHERE user_id=?",
+        (user_id,)
     ).fetchone()
 
     if row is None:
         DB.execute(
-            "INSERT INTO users(user_id, trial_started) VALUES(?, ?)",
-            (user_id, int(time.time())),
+            """
+            INSERT INTO users(user_id, trial_started)
+            VALUES(?, ?)
+            """,
+            (user_id, int(time.time()))
         )
         DB.commit()
         return True
@@ -159,9 +186,14 @@ def ensure_user(user_id):
 
 
 def access_status(user_id):
+
     row = DB.execute(
-        "SELECT trial_started, expires_at, forever FROM users WHERE user_id=?",
-        (user_id,),
+        """
+        SELECT trial_started, expires_at, forever
+        FROM users
+        WHERE user_id=?
+        """,
+        (user_id,)
     ).fetchone()
 
     if not row:
@@ -181,22 +213,201 @@ def access_status(user_id):
     return False, "🔒 Подписка не активна"
 
 
+def get_ticket(ticket_id):
+
+    return DB.execute(
+        "SELECT * FROM support_tickets WHERE id=?",
+        (ticket_id,)
+    ).fetchone()
+
+
+def get_open_ticket(user_id):
+
+    return DB.execute(
+        """
+        SELECT * FROM support_tickets
+        WHERE user_id=? AND status='open'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (user_id,)
+    ).fetchone()
+
+
+def support_ban_status(user_id):
+
+    row = DB.execute(
+        "SELECT expires_at FROM support_bans WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+
+    if not row:
+        return False, 0
+
+    expires = row["expires_at"]
+
+    if expires == 0:
+        return True, 0
+
+    if expires > int(time.time()):
+        return True, expires
+
+    DB.execute(
+        "DELETE FROM support_bans WHERE user_id=?",
+        (user_id,)
+    )
+    DB.commit()
+
+    return False, 0
+
+
+def save_support_message(ticket_id, sender_id, sender_type, text):
+
+    DB.execute(
+        """
+        INSERT INTO support_messages(
+            ticket_id,
+            sender_id,
+            sender_type,
+            message,
+            created_at
+        )
+        VALUES(?, ?, ?, ?, ?)
+        """,
+        (
+            ticket_id,
+            sender_id,
+            sender_type,
+            text,
+            int(time.time())
+        )
+    )
+
+    DB.commit()
+
+
+def support_keyboard(ticket_id):
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔒 Закрыть обращение",
+                    callback_data=f"ticket_close:{ticket_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📨 Мои обращения",
+                    callback_data="my_tickets"
+                )
+            ]
+        ]
+    )
+
+
 # ==================================
-# ИИ
+# ГЛАВНОЕ МЕНЮ
+# ==================================
+
+def menu():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+
+            [
+                InlineKeyboardButton(
+                    text="💬 Общение с ИИ",
+                    callback_data="chat"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🧠 Ответ на оскорбление",
+                    callback_data="smart"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🖼 Генерация фото",
+                    callback_data="photo"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🎬 Генерация видео",
+                    callback_data="video"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="✨ Редактор фото/видео",
+                    callback_data="editor"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🎙 Генерация голоса",
+                    callback_data="voice"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="💎 Купить подписку",
+                    callback_data="buy"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="👤 Мой профиль",
+                    callback_data="profile"
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🆘 Поддержка",
+                    callback_data="support"
+                )
+            ]
+
+        ]
+    )
+
+
+# ==================================
+# ИСКУССТВЕННЫЙ ИНТЕЛЛЕКТ
 # ==================================
 
 async def ask_ai(user_id, user_text, system_prompt):
+
     history = chat_history.setdefault(user_id, [])
 
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        }
+    ]
+
     messages.extend(history[-10:])
-    messages.append({"role": "user", "content": user_text})
+
+    messages.append({
+        "role": "user",
+        "content": user_text
+    })
 
     response = await ai.chat.completions.create(
         model=AI_MODEL,
         messages=messages,
         temperature=0.8,
-        max_tokens=700,
+        max_tokens=700
     )
 
     answer = (
@@ -205,8 +416,14 @@ async def ask_ai(user_id, user_text, system_prompt):
     )
 
     history.extend([
-        {"role": "user", "content": user_text},
-        {"role": "assistant", "content": answer},
+        {
+            "role": "user",
+            "content": user_text
+        },
+        {
+            "role": "assistant",
+            "content": answer
+        }
     ])
 
     chat_history[user_id] = history[-20:]
@@ -215,56 +432,36 @@ async def ask_ai(user_id, user_text, system_prompt):
 
 
 # ==================================
-# СТАРТ / МЕНЮ
+# СТАРТ И МЕНЮ
 # ==================================
 
 @dp.message(CommandStart())
 async def start(message: Message):
+
     is_new = ensure_user(message.from_user.id)
 
     intro = (
         "🎁 Вам доступен пробный период на 24 часа."
-        if is_new
-        else "С возвращением!"
+        if is_new else
+        "С возвращением!"
     )
 
     await message.answer(
-        f"🟠 <b>VEXORA AI</b>\n\n{intro}\n\nВыберите функцию в меню.",
-        reply_markup=menu(),
+        f"🟠 <b>VEXORA AI</b>\n\n"
+        f"{intro}\n\n"
+        "Выберите функцию в меню.",
+        reply_markup=menu()
     )
 
 
 @dp.message(Command("menu"))
 async def show_menu(message: Message):
-    await message.answer("Главное меню VEXORA AI:", reply_markup=menu())
 
-
-# ==================================
-# АДМИН: /activate
-# ==================================
-# /activate            — выдать себе подписку навсегда
-# /activate 123456789  — выдать подписку навсегда пользователю с этим ID
-
-@dp.message(Command("activate"))
-async def activate(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Недостаточно прав.")
-        return
-
-    parts = (message.text or "").split()
-
-    try:
-        target = int(parts[1]) if len(parts) > 1 else message.from_user.id
-    except ValueError:
-        await message.answer("Использование: /activate или /activate ID")
-        return
-
-    ensure_user(target)
-    DB.execute("UPDATE users SET forever=1 WHERE user_id=?", (target,))
-    DB.commit()
+    support_modes.pop(message.from_user.id, None)
 
     await message.answer(
-        f"✅ Подписка навсегда активирована для <code>{target}</code>."
+        "Главное меню VEXORA AI:",
+        reply_markup=menu()
     )
 
 
@@ -274,19 +471,23 @@ async def activate(message: Message):
 
 @dp.callback_query(F.data == "buy")
 async def buy(call: CallbackQuery):
+
     buttons = [
         [
             InlineKeyboardButton(
                 text=f"{name} — {price} ₽",
-                callback_data=f"plan:{key}",
+                callback_data=f"plan:{key}"
             )
         ]
         for key, (name, price, days) in PLANS.items()
     ]
 
     await call.message.answer(
-        "💎 <b>ТАРИФЫ VEXORA AI</b>\nВыберите подписку:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        "💎 <b>ТАРИФЫ VEXORA AI</b>\n"
+        "Выберите подписку:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
     )
 
     await call.answer()
@@ -294,10 +495,14 @@ async def buy(call: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("plan:"))
 async def choose_plan(call: CallbackQuery):
+
     key = call.data.split(":", 1)[1]
 
     if key not in PLANS:
-        await call.answer("Неизвестный тариф.", show_alert=True)
+        await call.answer(
+            "Неизвестный тариф.",
+            show_alert=True
+        )
         return
 
     selected_plan[call.from_user.id] = key
@@ -308,7 +513,7 @@ async def choose_plan(call: CallbackQuery):
         f"💳 <b>Оплата подписки</b>\n"
         f"Тариф: {name}\n"
         f"Сумма: {price} ₽\n\n"
-        f"{PAYMENT_DETAILS}\n\n"
+        f"{html.escape(PAYMENT_DETAILS)}\n\n"
         "После оплаты отправьте фото чека. "
         "Администратор проверит его вручную."
     )
@@ -322,21 +527,35 @@ async def choose_plan(call: CallbackQuery):
 
 @dp.message(F.photo)
 async def payment_photo(message: Message):
+
     uid = message.from_user.id
+
     key = selected_plan.get(uid)
 
     if not key:
-        await message.answer("Сначала выберите тариф в меню.")
+        await message.answer(
+            "Сначала выберите тариф в меню."
+        )
         return
 
     name, price, days = PLANS[key]
 
     cur = DB.execute(
         """
-        INSERT INTO payments(user_id, plan_key, photo_file_id, created_at)
+        INSERT INTO payments(
+            user_id,
+            plan_key,
+            photo_file_id,
+            created_at
+        )
         VALUES(?, ?, ?, ?)
         """,
-        (uid, key, message.photo[-1].file_id, int(time.time())),
+        (
+            uid,
+            key,
+            message.photo[-1].file_id,
+            int(time.time())
+        )
     )
 
     payment_id = cur.lastrowid
@@ -347,118 +566,185 @@ async def payment_photo(message: Message):
             [
                 InlineKeyboardButton(
                     text="✅ Одобрить",
-                    callback_data=f"approve:{payment_id}",
+                    callback_data=f"approve:{payment_id}"
                 ),
                 InlineKeyboardButton(
                     text="❌ Отклонить",
-                    callback_data=f"reject:{payment_id}",
-                ),
+                    callback_data=f"reject:{payment_id}"
+                )
             ]
         ]
     )
 
-    await bot.send_photo(
-        ADMIN_ID,
-        message.photo[-1].file_id,
-        caption=(
-            f"🧾 <b>Заявка #{payment_id}</b>\n"
-            f"Пользователь: <code>{uid}</code>\n"
-            f"Тариф: {name}\n"
-            f"Сумма: {price} ₽"
-        ),
-        reply_markup=keyboard,
-    )
+    try:
+        await bot.send_photo(
+            ADMIN_ID,
+            message.photo[-1].file_id,
+            caption=(
+                f"🧾 <b>Заявка #{payment_id}</b>\n"
+                f"Пользователь: <code>{uid}</code>\n"
+                f"Тариф: {html.escape(name)}\n"
+                f"Сумма: {price} ₽"
+            ),
+            reply_markup=keyboard
+        )
 
-    await message.answer("📨 Чек отправлен администратору!")
+        await message.answer(
+            "📨 Чек отправлен администратору!"
+        )
+
+    except Exception:
+        logging.exception("Не удалось отправить чек администратору")
+        await message.answer(
+            "Не удалось отправить чек. Попробуйте позже."
+        )
 
 
 # ==================================
-# ОДОБРЕНИЕ / ОТКЛОНЕНИЕ ОПЛАТЫ
+# ОДОБРЕНИЕ ОПЛАТЫ
 # ==================================
 
 @dp.callback_query(F.data.startswith("approve:"))
 async def approve_payment(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        await call.answer("Недостаточно прав.", show_alert=True)
+
+    if not is_admin(call.from_user.id):
+        await call.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
         return
 
-    payment_id = int(call.data.split(":")[1])
+    try:
+        payment_id = int(call.data.split(":")[1])
+    except ValueError:
+        await call.answer("Неверный номер заявки.", show_alert=True)
+        return
 
     payment = DB.execute(
-        "SELECT * FROM payments WHERE id=?", (payment_id,)
+        "SELECT * FROM payments WHERE id=?",
+        (payment_id,)
     ).fetchone()
 
     if not payment or payment["status"] != "pending":
-        await call.answer("Заявка уже обработана.", show_alert=True)
+        await call.answer(
+            "Заявка уже обработана.",
+            show_alert=True
+        )
         return
 
     uid = payment["user_id"]
     key = payment["plan_key"]
+
+    if key not in PLANS:
+        await call.answer("Неизвестный тариф.", show_alert=True)
+        return
+
     name, price, days = PLANS[key]
 
     ensure_user(uid)
 
     if key == "forever":
-        DB.execute("UPDATE users SET forever=1 WHERE user_id=?", (uid,))
+
+        DB.execute(
+            "UPDATE users SET forever=1 WHERE user_id=?",
+            (uid,)
+        )
+
     else:
+
         row = DB.execute(
-            "SELECT expires_at FROM users WHERE user_id=?", (uid,)
+            "SELECT expires_at FROM users WHERE user_id=?",
+            (uid,)
         ).fetchone()
 
-        start_at = max(int(time.time()), row["expires_at"])
+        start_at = max(
+            int(time.time()),
+            row["expires_at"]
+        )
 
         DB.execute(
             "UPDATE users SET expires_at=? WHERE user_id=?",
-            (start_at + days * 86400, uid),
+            (
+                start_at + days * 86400,
+                uid
+            )
         )
 
     DB.execute(
-        "UPDATE payments SET status='approved' WHERE id=?", (payment_id,)
+        "UPDATE payments SET status='approved' WHERE id=?",
+        (payment_id,)
     )
+
     DB.commit()
 
     selected_plan.pop(uid, None)
 
-    await bot.send_message(
-        uid,
-        f"🎉 Оплата подтверждена!\nПодписка «{name}» активирована.",
-    )
+    try:
+        await bot.send_message(
+            uid,
+            f"🎉 Оплата подтверждена!\n"
+            f"Подписка «{html.escape(name)}» активирована."
+        )
+    except Exception:
+        logging.exception("Не удалось уведомить пользователя")
 
     await call.message.edit_caption(
-        caption=f"✅ Заявка #{payment_id} одобрена."
+        f"✅ Заявка #{payment_id} одобрена."
     )
 
     await call.answer("Подписка выдана.")
 
 
+# ==================================
+# ОТКЛОНЕНИЕ ОПЛАТЫ
+# ==================================
+
 @dp.callback_query(F.data.startswith("reject:"))
 async def reject_payment(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        await call.answer("Недостаточно прав.", show_alert=True)
+
+    if not is_admin(call.from_user.id):
+        await call.answer(
+            "Недостаточно прав.",
+            show_alert=True
+        )
         return
 
-    payment_id = int(call.data.split(":")[1])
+    try:
+        payment_id = int(call.data.split(":")[1])
+    except ValueError:
+        await call.answer("Неверный номер заявки.", show_alert=True)
+        return
 
     payment = DB.execute(
-        "SELECT * FROM payments WHERE id=?", (payment_id,)
+        "SELECT * FROM payments WHERE id=?",
+        (payment_id,)
     ).fetchone()
 
     if not payment or payment["status"] != "pending":
-        await call.answer("Заявка уже обработана.", show_alert=True)
+        await call.answer(
+            "Заявка уже обработана.",
+            show_alert=True
+        )
         return
 
     DB.execute(
-        "UPDATE payments SET status='rejected' WHERE id=?", (payment_id,)
+        "UPDATE payments SET status='rejected' WHERE id=?",
+        (payment_id,)
     )
+
     DB.commit()
 
-    await bot.send_message(
-        payment["user_id"],
-        "❌ Заявка отклонена. Свяжитесь с администратором.",
-    )
+    try:
+        await bot.send_message(
+            payment["user_id"],
+            "❌ Заявка отклонена. "
+            "Свяжитесь с администратором."
+        )
+    except Exception:
+        logging.exception("Не удалось уведомить пользователя")
 
     await call.message.edit_caption(
-        caption=f"❌ Заявка #{payment_id} отклонена."
+        f"❌ Заявка #{payment_id} отклонена."
     )
 
     await call.answer("Заявка отклонена.")
@@ -470,25 +756,35 @@ async def reject_payment(call: CallbackQuery):
 
 @dp.callback_query(F.data == "profile")
 async def profile(call: CallbackQuery):
+
     ensure_user(call.from_user.id)
 
     allowed, status = access_status(call.from_user.id)
 
     row = DB.execute(
-        "SELECT trial_started, expires_at FROM users WHERE user_id=?",
-        (call.from_user.id,),
+        """
+        SELECT trial_started, expires_at
+        FROM users
+        WHERE user_id=?
+        """,
+        (call.from_user.id,)
     ).fetchone()
 
     remaining = max(
-        0, row["trial_started"] + TRIAL_SECONDS - int(time.time())
+        0,
+        row["trial_started"] + TRIAL_SECONDS - int(time.time())
     )
 
     if status == "🎁 Пробный период":
         status += f"\nОсталось примерно {remaining // 3600} ч."
+
     elif row["expires_at"] > int(time.time()):
+
         expiry = datetime.fromtimestamp(
-            row["expires_at"], timezone.utc
+            row["expires_at"],
+            timezone.utc
         ).strftime("%Y-%m-%d %H:%M UTC")
+
         status += f"\nДо: {expiry}"
 
     await call.message.answer(
@@ -501,21 +797,28 @@ async def profile(call: CallbackQuery):
 
 
 # ==================================
-# РЕЖИМЫ
+# СВОБОДНОЕ ОБЩЕНИЕ
 # ==================================
 
 @dp.callback_query(F.data == "chat")
 async def enable_chat(call: CallbackQuery):
+
     ensure_user(call.from_user.id)
 
     allowed, status = access_status(call.from_user.id)
 
     if not allowed:
+
         await call.message.answer(
-            "🔒 Пробный период закончился. Оформите подписку."
+            "🔒 Пробный период закончился. "
+            "Оформите подписку."
         )
+
     else:
+
+        support_modes.pop(call.from_user.id, None)
         user_modes[call.from_user.id] = "chat"
+
         chat_history.pop(call.from_user.id, None)
 
         await call.message.answer(
@@ -527,18 +830,28 @@ async def enable_chat(call: CallbackQuery):
     await call.answer()
 
 
+# ==================================
+# УМНЫЙ ОТВЕТ НА ОСКОРБЛЕНИЯ
+# ==================================
+
 @dp.callback_query(F.data == "smart")
 async def smart_mode(call: CallbackQuery):
+
     ensure_user(call.from_user.id)
 
     allowed, status = access_status(call.from_user.id)
 
     if not allowed:
+
         await call.message.answer(
             "🔒 Оформите подписку, чтобы пользоваться ИИ."
         )
+
     else:
+
+        support_modes.pop(call.from_user.id, None)
         user_modes[call.from_user.id] = "smart"
+
         chat_history.pop(call.from_user.id, None)
 
         await call.message.answer(
@@ -552,107 +865,54 @@ async def smart_mode(call: CallbackQuery):
     await call.answer()
 
 
+# ==================================
+# ОЧИСТКА ИСТОРИИ
+# ==================================
+
 @dp.message(Command("clear"))
 async def clear_history(message: Message):
+
     chat_history.pop(message.from_user.id, None)
+
     await message.answer("История общения очищена.")
 
 
 # ==================================
-# ОБРАБОТКА ТЕКСТА
+# ПОДДЕРЖКА — МЕНЮ
 # ==================================
 
-@dp.message(F.text)
-async def text_to_ai(message: Message):
+@dp.message(Command("support"))
+async def support_command(message: Message):
+
+    await show_support_menu(message)
+
+
+async def show_support_menu(message: Message):
+
     uid = message.from_user.id
 
-    ensure_user(uid)
+    banned, expires = support_ban_status(uid)
 
-    allowed, status = access_status(uid)
+    if banned:
 
-    if not allowed:
-        await message.answer(
-            "🔒 Бесплатные 24 часа закончились.\n"
-            "Нажмите «Купить подписку».",
-            reply_markup=menu(),
-        )
+        if expires == 0:
+            text = "🚫 Вы навсегда заблокированы в поддержке."
+        else:
+            remaining = max(0, expires - int(time.time()))
+            text = (
+                "🚫 Вы временно заблокированы в поддержке.\n"
+                f"Осталось секунд: {remaining}"
+            )
+
+        await message.answer(text)
         return
 
-    mode = user_modes.get(uid, "chat")
+    ticket = get_open_ticket(uid)
 
-    if mode == "smart":
-        system_prompt = (
-            "Ты VEXORA AI. Помогаешь человеку отвечать "
-            "на оскорбления без угроз и травли. "
-            "Предложи три коротких варианта: "
-            "спокойный, остроумный и уверенный."
-        )
-    else:
-        system_prompt = (
-            "Ты VEXORA AI — дружелюбный и полезный "
-            "ИИ-помощник. Отвечай понятно на русском языке. "
-            "Не выдумывай факты."
-        )
+    if ticket:
 
-    try:
-        await bot.send_chat_action(message.chat.id, "typing")
-
-        answer = await ask_ai(uid, message.text, system_prompt)
-
-        for i in range(0, len(answer), 4000):
-            await message.answer(html.escape(answer[i:i + 4000]))
-
-    except Exception:
-        logging.exception("AI request failed")
+        support_modes[uid] = ticket["id"]
 
         await message.answer(
-            "⚠️ Не удалось связаться с ИИ. Попробуйте позже."
-        )
-
-
-# ==================================
-# ФУНКЦИИ В РАЗРАБОТКЕ
-# ==================================
-
-@dp.callback_query(F.data.in_({"photo", "video", "editor", "voice"}))
-async def future_features(call: CallbackQuery):
-    ensure_user(call.from_user.id)
-
-    allowed, status = access_status(call.from_user.id)
-
-    if not allowed:
-        await call.message.answer(
-            "🔒 Оформите подписку, чтобы пользоваться функциями."
-        )
-    else:
-        labels = {
-            "photo": "Генерация фото",
-            "video": "Генерация видео",
-            "editor": "Редактор фото/видео",
-            "voice": "Генерация голоса",
-        }
-
-        await call.message.answer(
-            f"🚧 «{labels[call.data]}» пока в разработке.\n"
-            "Эта функция ещё не подключена."
-        )
-
-    await call.answer()
-
-
-# ==================================
-# ЗАПУСК БОТА
-# ==================================
-
-async def main():
-    print("🟠 VEXORA AI запущен!")
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-        await ai.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            f"🆘 У вас открыто обращение "
+            f"№{ticket_numb
