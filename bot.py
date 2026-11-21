@@ -1,9 +1,9 @@
-
 import asyncio
 import time
 import sqlite3
 import logging
 import html
+import os
 
 from datetime import datetime, timezone
 
@@ -24,6 +24,10 @@ from openai import AsyncOpenAI
 # ==================================
 # VEXORA AI — НАСТРОЙКИ
 # ==================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+AI_API_KEY = os.getenv("AI_API_KEY")
+
 ADMIN_ID = 8939059429
 
 AI_BASE_URL = "https://api.groq.com/openai/v1"
@@ -31,14 +35,11 @@ AI_MODEL = "openai/gpt-oss-120b"
 
 PAYMENT_DETAILS = "Реквизиты для оплаты"
 
-TRIAL_SECONDS = 24 * 60 * 60
+if not BOT_TOKEN:
+    raise ValueError("Не задан BOT_TOKEN!")
 
-
-if BOT_TOKEN.startswith("ВСТАВЬ_"):
-    raise ValueError("Вставь Telegram-токен!")
-
-if AI_API_KEY.startswith("ВСТАВЬ_"):
-    raise ValueError("Вставь Groq API-ключ!")
+if not AI_API_KEY:
+    raise ValueError("Не задан AI_API_KEY!")
 
 
 # ==================================
@@ -92,8 +93,7 @@ CREATE TABLE IF NOT EXISTS payments (
 )
 """)
 
-# Тикеты поддержки
-
+# Обращения пользователей
 DB.execute("""
 CREATE TABLE IF NOT EXISTS support_tickets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,8 +104,7 @@ CREATE TABLE IF NOT EXISTS support_tickets (
 )
 """)
 
-# Сообщения внутри тикетов
-
+# Сообщения поддержки
 DB.execute("""
 CREATE TABLE IF NOT EXISTS support_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,8 +116,7 @@ CREATE TABLE IF NOT EXISTS support_messages (
 )
 """)
 
-# Баны поддержки
-
+# Блокировки поддержки
 DB.execute("""
 CREATE TABLE IF NOT EXISTS support_bans (
     user_id INTEGER PRIMARY KEY,
@@ -131,8 +129,10 @@ DB.commit()
 
 
 # ==================================
-# ТАРИФЫ И СОСТОЯНИЯ
+# ТАРИФЫ
 # ==================================
+
+TRIAL_SECONDS = 24 * 60 * 60
 
 PLANS = {
     "1": ("1 месяц", 50, 30),
@@ -148,21 +148,82 @@ chat_history = {}
 selected_plan = {}
 user_modes = {}
 
-# Режимы переписки с поддержкой
+# Режим переписки поддержки
 support_modes = {}
 
+# Режим ответа администратора
+admin_ticket_modes = {}
+
 
 # ==================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# МЕНЮ
 # ==================================
 
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+def menu():
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Общение с ИИ",
+                    callback_data="chat"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧠 Ответ на оскорбление",
+                    callback_data="smart"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🖼 Генерация фото",
+                    callback_data="photo"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎬 Генерация видео",
+                    callback_data="video"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✨ Редактор фото/видео",
+                    callback_data="editor"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎙 Генерация голоса",
+                    callback_data="voice"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💎 Купить подписку",
+                    callback_data="buy"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👤 Мой профиль",
+                    callback_data="profile"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🆘 Поддержка",
+                    callback_data="support"
+                )
+            ]
+        ]
+    )
 
 
-def ticket_number(ticket_id):
-    return f"{ticket_id:03d}"
-
+# ==================================
+# ПОЛЬЗОВАТЕЛИ И ДОСТУП
+# ==================================
 
 def ensure_user(user_id):
 
@@ -172,6 +233,7 @@ def ensure_user(user_id):
     ).fetchone()
 
     if row is None:
+
         DB.execute(
             """
             INSERT INTO users(user_id, trial_started)
@@ -179,6 +241,7 @@ def ensure_user(user_id):
             """,
             (user_id, int(time.time()))
         )
+
         DB.commit()
         return True
 
@@ -190,8 +253,7 @@ def access_status(user_id):
     row = DB.execute(
         """
         SELECT trial_started, expires_at, forever
-        FROM users
-        WHERE user_id=?
+        FROM users WHERE user_id=?
         """,
         (user_id,)
     ).fetchone()
@@ -213,12 +275,37 @@ def access_status(user_id):
     return False, "🔒 Подписка не активна"
 
 
-def get_ticket(ticket_id):
+# ==================================
+# СИСТЕМА ПОДДЕРЖКИ
+# ==================================
 
-    return DB.execute(
-        "SELECT * FROM support_tickets WHERE id=?",
-        (ticket_id,)
+def support_is_banned(user_id):
+
+    row = DB.execute(
+        "SELECT expires_at FROM support_bans WHERE user_id=?",
+        (user_id,)
     ).fetchone()
+
+    if not row:
+        return False
+
+    expires = row["expires_at"]
+
+    # 0 означает бессрочную блокировку
+    if expires == 0:
+        return True
+
+    if expires > int(time.time()):
+        return True
+
+    # Срок блокировки закончился
+    DB.execute(
+        "DELETE FROM support_bans WHERE user_id=?",
+        (user_id,)
+    )
+    DB.commit()
+
+    return False
 
 
 def get_open_ticket(user_id):
@@ -233,31 +320,9 @@ def get_open_ticket(user_id):
     ).fetchone()
 
 
-def support_ban_status(user_id):
+def ticket_number(ticket_id):
 
-    row = DB.execute(
-        "SELECT expires_at FROM support_bans WHERE user_id=?",
-        (user_id,)
-    ).fetchone()
-
-    if not row:
-        return False, 0
-
-    expires = row["expires_at"]
-
-    if expires == 0:
-        return True, 0
-
-    if expires > int(time.time()):
-        return True, expires
-
-    DB.execute(
-        "DELETE FROM support_bans WHERE user_id=?",
-        (user_id,)
-    )
-    DB.commit()
-
-    return False, 0
+    return str(ticket_id).zfill(3)
 
 
 def save_support_message(ticket_id, sender_id, sender_type, text):
@@ -285,634 +350,528 @@ def save_support_message(ticket_id, sender_id, sender_type, text):
     DB.commit()
 
 
-def support_keyboard(ticket_id):
+def support_menu():
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Создать обращение",
+                    callback_data="ticket_create"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📂 Мои обращения",
+                    callback_data="ticket_my"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ Главное меню",
+                    callback_data="chat"
+                )
+            ]
+        ]
+    )
+
+
+def user_ticket_keyboard(ticket_id):
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💬 Продолжить переписку",
+                    callback_data=f"ticket_continue:{ticket_id}"
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text="🔒 Закрыть обращение",
                     callback_data=f"ticket_close:{ticket_id}"
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📨 Мои обращения",
-                    callback_data="my_tickets"
-                )
             ]
         ]
     )
 
 
-# ==================================
-# ГЛАВНОЕ МЕНЮ
-# ==================================
-
-def menu():
+def admin_ticket_keyboard(ticket_id):
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-
             [
                 InlineKeyboardButton(
-                    text="💬 Общение с ИИ",
-                    callback_data="chat"
+                    text="✉️ Ответить",
+                    callback_data=f"admin_reply:{ticket_id}"
                 )
             ],
-
             [
                 InlineKeyboardButton(
-                    text="🧠 Ответ на оскорбление",
-                    callback_data="smart"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🖼 Генерация фото",
-                    callback_data="photo"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🎬 Генерация видео",
-                    callback_data="video"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="✨ Редактор фото/видео",
-                    callback_data="editor"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🎙 Генерация голоса",
-                    callback_data="voice"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="💎 Купить подписку",
-                    callback_data="buy"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="👤 Мой профиль",
-                    callback_data="profile"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    text="🆘 Поддержка",
-                    callback_data="support"
-                )
-            ]
-
-        ]
-    )
-
-
-# ==================================
-# ИСКУССТВЕННЫЙ ИНТЕЛЛЕКТ
-# ==================================
-
-async def ask_ai(user_id, user_text, system_prompt):
-
-    history = chat_history.setdefault(user_id, [])
-
-    messages = [
-        {
-            "role": "system",
-            "content": system_prompt
-        }
-    ]
-
-    messages.extend(history[-10:])
-
-    messages.append({
-        "role": "user",
-        "content": user_text
-    })
-
-    response = await ai.chat.completions.create(
-        model=AI_MODEL,
-        messages=messages,
-        temperature=0.8,
-        max_tokens=700
-    )
-
-    answer = (
-        response.choices[0].message.content
-        or "Не получилось сформировать ответ."
-    )
-
-    history.extend([
-        {
-            "role": "user",
-            "content": user_text
-        },
-        {
-            "role": "assistant",
-            "content": answer
-        }
-    ])
-
-    chat_history[user_id] = history[-20:]
-
-    return answer
-
-
-# ==================================
-# СТАРТ И МЕНЮ
-# ==================================
-
-@dp.message(CommandStart())
-async def start(message: Message):
-
-    is_new = ensure_user(message.from_user.id)
-
-    intro = (
-        "🎁 Вам доступен пробный период на 24 часа."
-        if is_new else
-        "С возвращением!"
-    )
-
-    await message.answer(
-        f"🟠 <b>VEXORA AI</b>\n\n"
-        f"{intro}\n\n"
-        "Выберите функцию в меню.",
-        reply_markup=menu()
-    )
-
-
-@dp.message(Command("menu"))
-async def show_menu(message: Message):
-
-    support_modes.pop(message.from_user.id, None)
-
-    await message.answer(
-        "Главное меню VEXORA AI:",
-        reply_markup=menu()
-    )
-
-
-# ==================================
-# ПОКУПКА ПОДПИСКИ
-# ==================================
-
-@dp.callback_query(F.data == "buy")
-async def buy(call: CallbackQuery):
-
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text=f"{name} — {price} ₽",
-                callback_data=f"plan:{key}"
-            )
-        ]
-        for key, (name, price, days) in PLANS.items()
-    ]
-
-    await call.message.answer(
-        "💎 <b>ТАРИФЫ VEXORA AI</b>\n"
-        "Выберите подписку:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        )
-    )
-
-    await call.answer()
-
-
-@dp.callback_query(F.data.startswith("plan:"))
-async def choose_plan(call: CallbackQuery):
-
-    key = call.data.split(":", 1)[1]
-
-    if key not in PLANS:
-        await call.answer(
-            "Неизвестный тариф.",
-            show_alert=True
-        )
-        return
-
-    selected_plan[call.from_user.id] = key
-
-    name, price, days = PLANS[key]
-
-    await call.message.answer(
-        f"💳 <b>Оплата подписки</b>\n"
-        f"Тариф: {name}\n"
-        f"Сумма: {price} ₽\n\n"
-        f"{html.escape(PAYMENT_DETAILS)}\n\n"
-        "После оплаты отправьте фото чека. "
-        "Администратор проверит его вручную."
-    )
-
-    await call.answer()
-
-
-# ==================================
-# ПОЛУЧЕНИЕ ЧЕКА
-# ==================================
-
-@dp.message(F.photo)
-async def payment_photo(message: Message):
-
-    uid = message.from_user.id
-
-    key = selected_plan.get(uid)
-
-    if not key:
-        await message.answer(
-            "Сначала выберите тариф в меню."
-        )
-        return
-
-    name, price, days = PLANS[key]
-
-    cur = DB.execute(
-        """
-        INSERT INTO payments(
-            user_id,
-            plan_key,
-            photo_file_id,
-            created_at
-        )
-        VALUES(?, ?, ?, ?)
-        """,
-        (
-            uid,
-            key,
-            message.photo[-1].file_id,
-            int(time.time())
-        )
-    )
-
-    payment_id = cur.lastrowid
-    DB.commit()
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Одобрить",
-                    callback_data=f"approve:{payment_id}"
-                ),
-                InlineKeyboardButton(
-                    text="❌ Отклонить",
-                    callback_data=f"reject:{payment_id}"
+                    text="🔒 Закрыть обращение",
+                    callback_data=f"ticket_close:{ticket_id}"
                 )
             ]
         ]
     )
 
-    try:
-        await bot.send_photo(
-            ADMIN_ID,
-            message.photo[-1].file_id,
-            caption=(
-                f"🧾 <b>Заявка #{payment_id}</b>\n"
-                f"Пользователь: <code>{uid}</code>\n"
-                f"Тариф: {html.escape(name)}\n"
-                f"Сумма: {price} ₽"
-            ),
-            reply_markup=keyboard
-        )
-
-        await message.answer(
-            "📨 Чек отправлен администратору!"
-        )
-
-    except Exception:
-        logging.exception("Не удалось отправить чек администратору")
-        await message.answer(
-            "Не удалось отправить чек. Попробуйте позже."
-        )
-
 
 # ==================================
-# ОДОБРЕНИЕ ОПЛАТЫ
-# ==================================
-
-@dp.callback_query(F.data.startswith("approve:"))
-async def approve_payment(call: CallbackQuery):
-
-    if not is_admin(call.from_user.id):
-        await call.answer(
-            "Недостаточно прав.",
-            show_alert=True
-        )
-        return
-
-    try:
-        payment_id = int(call.data.split(":")[1])
-    except ValueError:
-        await call.answer("Неверный номер заявки.", show_alert=True)
-        return
-
-    payment = DB.execute(
-        "SELECT * FROM payments WHERE id=?",
-        (payment_id,)
-    ).fetchone()
-
-    if not payment or payment["status"] != "pending":
-        await call.answer(
-            "Заявка уже обработана.",
-            show_alert=True
-        )
-        return
-
-    uid = payment["user_id"]
-    key = payment["plan_key"]
-
-    if key not in PLANS:
-        await call.answer("Неизвестный тариф.", show_alert=True)
-        return
-
-    name, price, days = PLANS[key]
-
-    ensure_user(uid)
-
-    if key == "forever":
-
-        DB.execute(
-            "UPDATE users SET forever=1 WHERE user_id=?",
-            (uid,)
-        )
-
-    else:
-
-        row = DB.execute(
-            "SELECT expires_at FROM users WHERE user_id=?",
-            (uid,)
-        ).fetchone()
-
-        start_at = max(
-            int(time.time()),
-            row["expires_at"]
-        )
-
-        DB.execute(
-            "UPDATE users SET expires_at=? WHERE user_id=?",
-            (
-                start_at + days * 86400,
-                uid
-            )
-        )
-
-    DB.execute(
-        "UPDATE payments SET status='approved' WHERE id=?",
-        (payment_id,)
-    )
-
-    DB.commit()
-
-    selected_plan.pop(uid, None)
-
-    try:
-        await bot.send_message(
-            uid,
-            f"🎉 Оплата подтверждена!\n"
-            f"Подписка «{html.escape(name)}» активирована."
-        )
-    except Exception:
-        logging.exception("Не удалось уведомить пользователя")
-
-    await call.message.edit_caption(
-        f"✅ Заявка #{payment_id} одобрена."
-    )
-
-    await call.answer("Подписка выдана.")
-
-
-# ==================================
-# ОТКЛОНЕНИЕ ОПЛАТЫ
-# ==================================
-
-@dp.callback_query(F.data.startswith("reject:"))
-async def reject_payment(call: CallbackQuery):
-
-    if not is_admin(call.from_user.id):
-        await call.answer(
-            "Недостаточно прав.",
-            show_alert=True
-        )
-        return
-
-    try:
-        payment_id = int(call.data.split(":")[1])
-    except ValueError:
-        await call.answer("Неверный номер заявки.", show_alert=True)
-        return
-
-    payment = DB.execute(
-        "SELECT * FROM payments WHERE id=?",
-        (payment_id,)
-    ).fetchone()
-
-    if not payment or payment["status"] != "pending":
-        await call.answer(
-            "Заявка уже обработана.",
-            show_alert=True
-        )
-        return
-
-    DB.execute(
-        "UPDATE payments SET status='rejected' WHERE id=?",
-        (payment_id,)
-    )
-
-    DB.commit()
-
-    try:
-        await bot.send_message(
-            payment["user_id"],
-            "❌ Заявка отклонена. "
-            "Свяжитесь с администратором."
-        )
-    except Exception:
-        logging.exception("Не удалось уведомить пользователя")
-
-    await call.message.edit_caption(
-        f"❌ Заявка #{payment_id} отклонена."
-    )
-
-    await call.answer("Заявка отклонена.")
-
-
-# ==================================
-# ПРОФИЛЬ
-# ==================================
-
-@dp.callback_query(F.data == "profile")
-async def profile(call: CallbackQuery):
-
-    ensure_user(call.from_user.id)
-
-    allowed, status = access_status(call.from_user.id)
-
-    row = DB.execute(
-        """
-        SELECT trial_started, expires_at
-        FROM users
-        WHERE user_id=?
-        """,
-        (call.from_user.id,)
-    ).fetchone()
-
-    remaining = max(
-        0,
-        row["trial_started"] + TRIAL_SECONDS - int(time.time())
-    )
-
-    if status == "🎁 Пробный период":
-        status += f"\nОсталось примерно {remaining // 3600} ч."
-
-    elif row["expires_at"] > int(time.time()):
-
-        expiry = datetime.fromtimestamp(
-            row["expires_at"],
-            timezone.utc
-        ).strftime("%Y-%m-%d %H:%M UTC")
-
-        status += f"\nДо: {expiry}"
-
-    await call.message.answer(
-        f"👤 <b>Профиль</b>\n"
-        f"ID: <code>{call.from_user.id}</code>\n"
-        f"Статус: {status}"
-    )
-
-    await call.answer()
-
-
-# ==================================
-# СВОБОДНОЕ ОБЩЕНИЕ
-# ==================================
-
-@dp.callback_query(F.data == "chat")
-async def enable_chat(call: CallbackQuery):
-
-    ensure_user(call.from_user.id)
-
-    allowed, status = access_status(call.from_user.id)
-
-    if not allowed:
-
-        await call.message.answer(
-            "🔒 Пробный период закончился. "
-            "Оформите подписку."
-        )
-
-    else:
-
-        support_modes.pop(call.from_user.id, None)
-        user_modes[call.from_user.id] = "chat"
-
-        chat_history.pop(call.from_user.id, None)
-
-        await call.message.answer(
-            "💬 Режим общения включён!\n"
-            "Просто напишите мне сообщение.\n"
-            "Для очистки истории используйте /clear."
-        )
-
-    await call.answer()
-
-
-# ==================================
-# УМНЫЙ ОТВЕТ НА ОСКОРБЛЕНИЯ
-# ==================================
-
-@dp.callback_query(F.data == "smart")
-async def smart_mode(call: CallbackQuery):
-
-    ensure_user(call.from_user.id)
-
-    allowed, status = access_status(call.from_user.id)
-
-    if not allowed:
-
-        await call.message.answer(
-            "🔒 Оформите подписку, чтобы пользоваться ИИ."
-        )
-
-    else:
-
-        support_modes.pop(call.from_user.id, None)
-        user_modes[call.from_user.id] = "smart"
-
-        chat_history.pop(call.from_user.id, None)
-
-        await call.message.answer(
-            "🧠 Пришлите оскорбление или неприятное сообщение.\n"
-            "Я предложу три варианта ответа:\n"
-            "1. Спокойный\n"
-            "2. Остроумный\n"
-            "3. Уверенный"
-        )
-
-    await call.answer()
-
-
-# ==================================
-# ОЧИСТКА ИСТОРИИ
-# ==================================
-
-@dp.message(Command("clear"))
-async def clear_history(message: Message):
-
-    chat_history.pop(message.from_user.id, None)
-
-    await message.answer("История общения очищена.")
-
-
-# ==================================
-# ПОДДЕРЖКА — МЕНЮ
+# ОТКРЫТИЕ ПОДДЕРЖКИ
 # ==================================
 
 @dp.message(Command("support"))
 async def support_command(message: Message):
 
-    await show_support_menu(message)
-
-
-async def show_support_menu(message: Message):
-
     uid = message.from_user.id
 
-    banned, expires = support_ban_status(uid)
-
-    if banned:
-
-        if expires == 0:
-            text = "🚫 Вы навсегда заблокированы в поддержке."
-        else:
-            remaining = max(0, expires - int(time.time()))
-            text = (
-                "🚫 Вы временно заблокированы в поддержке.\n"
-                f"Осталось секунд: {remaining}"
-            )
-
-        await message.answer(text)
+    if support_is_banned(uid):
+        await message.answer(
+            "🚫 Доступ к поддержке ограничен."
+        )
         return
 
-    ticket = get_open_ticket(uid)
+    await message.answer(
+        "🆘 <b>Поддержка VEXORA AI</b>\n\n"
+        "Здесь ты можешь обратиться к администратору.\n"
+        "Создай обращение или посмотри свои предыдущие обращения.",
+        reply_markup=support_menu()
+    )
 
-    if ticket:
 
-        support_modes[uid] = ticket["id"]
+@dp.callback_query(F.data == "support")
+async def support_callback(call: CallbackQuery):
+
+    uid = call.from_user.id
+
+    if support_is_banned(uid):
+        await call.answer(
+            "🚫 Доступ к поддержке ограничен.",
+            show_alert=True
+        )
+        return
+
+    await call.message.answer(
+        "🆘 <b>Поддержка VEXORA AI</b>\n\n"
+        "Выбери нужное действие:",
+        reply_markup=support_menu()
+    )
+
+    await call.answer()
+
+
+# ==================================
+# СОЗДАНИЕ ОБРАЩЕНИЯ
+# ==================================
+
+@dp.callback_query(F.data == "ticket_create")
+async def create_ticket(call: CallbackQuery):
+
+    uid = call.from_user.id
+
+    if support_is_banned(uid):
+        await call.answer(
+            "🚫 Доступ к поддержке ограничен.",
+            show_alert=True
+        )
+        return
+
+    existing = get_open_ticket(uid)
+
+    if existing:
+
+        ticket_id = existing["id"]
+
+        await call.message.answer(
+            f"У тебя уже есть открытое обращение "
+            f"№{ticket_number(ticket_id)}.",
+            reply_markup=user_ticket_keyboard(ticket_id)
+        )
+
+        await call.answer()
+        return
+
+    cur = DB.execute(
+        """
+        INSERT INTO support_tickets(user_id, status, created_at)
+        VALUES(?, 'open', ?)
+        """,
+        (uid, int(time.time()))
+    )
+
+    DB.commit()
+
+    ticket_id = cur.lastrowid
+
+    support_modes[uid] = ticket_id
+
+    await call.message.answer(
+        f"✅ Обращение №{ticket_number(ticket_id)} создано!\n\n"
+        "✍️ Напиши своё сообщение. "
+        "Оно будет отправлено администратору.\n\n"
+        "Чтобы закончить переписку, используй кнопку закрытия."
+    )
+
+    try:
+
+        await bot.send_message(
+            ADMIN_ID,
+            f"🆘 <b>Новое обращение №{ticket_number(ticket_id)}</b>\n\n"
+            f"👤 Пользователь: <code>{uid}</code>\n"
+            f"🕒 Время: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+            reply_markup=admin_ticket_keyboard(ticket_id)
+        )
+
+    except Exception:
+
+        logging.exception("Не удалось уведомить администратора")
+
+        await call.message.answer(
+            "⚠️ Обращение создано, но не удалось уведомить администратора. "
+            "Попробуй позже."
+        )
+
+    await call.answer()
+
+
+# ==================================
+# МОИ ОБРАЩЕНИЯ
+# ==================================
+
+@dp.callback_query(F.data == "ticket_my")
+async def my_tickets(call: CallbackQuery):
+
+    uid = call.from_user.id
+
+    rows = DB.execute(
+        """
+        SELECT * FROM support_tickets
+        WHERE user_id=?
+        ORDER BY id DESC LIMIT 10
+        """,
+        (uid,)
+    ).fetchall()
+
+    if not rows:
+
+        await call.message.answer(
+            "📂 У тебя пока нет обращений."
+        )
+
+        await call.answer()
+        return
+
+    for row in rows:
+
+        ticket_id = row["id"]
+
+        status = (
+            "🟢 Открыто"
+            if row["status"] == "open"
+            else "🔒 Закрыто"
+        )
+
+        keyboard = None
+
+        if row["status"] == "open":
+
+            keyboard = user_ticket_keyboard(ticket_id)
+
+        await call.message.answer(
+            f"📂 <b>Обращение №{ticket_number(ticket_id)}</b>\n"
+            f"Статус: {status}",
+            reply_markup=keyboard
+        )
+
+    await call.answer()
+
+
+# ==================================
+# ПРОДОЛЖЕНИЕ ПЕРЕПИСКИ
+# ==================================
+
+@dp.callback_query(F.data.startswith("ticket_continue:"))
+async def continue_ticket(call: CallbackQuery):
+
+    ticket_id = int(call.data.split(":")[1])
+
+    ticket = DB.execute(
+        "SELECT * FROM support_tickets WHERE id=?",
+        (ticket_id,)
+    ).fetchone()
+
+    if not ticket or ticket["user_id"] != call.from_user.id:
+        await call.answer("Обращение не найдено.", show_alert=True)
+        return
+
+    if ticket["status"] != "open":
+        await call.answer("Обращение закрыто.", show_alert=True)
+        return
+
+    if support_is_banned(call.from_user.id):
+        await call.answer("Доступ к поддержке ограничен.", show_alert=True)
+        return
+
+    support_modes[call.from_user.id] = ticket_id
+
+    await call.message.answer(
+        f"💬 Переписка по обращению №{ticket_number(ticket_id)} включена.\n"
+        "Напиши сообщение."
+    )
+
+    await call.answer()
+
+
+# ==================================
+# ЗАКРЫТИЕ ОБРАЩЕНИЯ
+# ==================================
+
+@dp.callback_query(F.data.startswith("ticket_close:"))
+async def close_ticket_callback(call: CallbackQuery):
+
+    ticket_id = int(call.data.split(":")[1])
+
+    ticket = DB.execute(
+        "SELECT * FROM support_tickets WHERE id=?",
+        (ticket_id,)
+    ).fetchone()
+
+    if not ticket:
+        await call.answer("Обращение не найдено.", show_alert=True)
+        return
+
+    if (
+        call.from_user.id != ADMIN_ID
+        and call.from_user.id != ticket["user_id"]
+    ):
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    DB.execute(
+        """
+        UPDATE support_tickets
+        SET status='closed', closed_at=?
+        WHERE id=?
+        """,
+        (int(time.time()), ticket_id)
+    )
+
+    DB.commit()
+
+    support_modes.pop(ticket["user_id"], None)
+    admin_ticket_modes.pop(ADMIN_ID, None)
+
+    await call.message.answer(
+        f"🔒 Обращение №{ticket_number(ticket_id)} закрыто."
+    )
+
+    if call.from_user.id == ADMIN_ID:
+
+        try:
+            await bot.send_message(
+                ticket["user_id"],
+                f"🔒 Твоё обращение №{ticket_number(ticket_id)} закрыто администратором."
+            )
+        except Exception:
+            pass
+
+    else:
+
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🔒 Пользователь закрыл обращение №{ticket_number(ticket_id)}."
+            )
+        except Exception:
+            pass
+
+    await call.answer("Обращение закрыто.")
+
+
+# ==================================
+# ОТВЕТ АДМИНИСТРАТОРА
+# ==================================
+
+@dp.callback_query(F.data.startswith("admin_reply:"))
+async def admin_reply_callback(call: CallbackQuery):
+
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Недостаточно прав.", show_alert=True)
+        return
+
+    ticket_id = int(call.data.split(":")[1])
+
+    ticket = DB.execute(
+        "SELECT * FROM support_tickets WHERE id=?",
+        (ticket_id,)
+    ).fetchone()
+
+    if not ticket or ticket["status"] != "open":
+        await call.answer("Обращение закрыто или не найдено.", show_alert=True)
+        return
+
+    admin_ticket_modes[ADMIN_ID] = ticket_id
+
+    await call.message.answer(
+        f"✉️ Ответ на обращение №{ticket_number(ticket_id)}.\n\n"
+        "Напиши сообщение пользователю.\n"
+        "Для отмены используй /cancel."
+    )
+
+    await call.answer()
+
+
+# ==================================
+# КОМАНДЫ АДМИНИСТРАТОРА
+# ==================================
+
+@dp.message(Command("tickets"))
+async def admin_tickets(message: Message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    rows = DB.execute(
+        """
+        SELECT * FROM support_tickets
+        ORDER BY id DESC LIMIT 30
+        """
+    ).fetchall()
+
+    if not rows:
+        await message.answer("Обращений пока нет.")
+        return
+
+    for row in rows:
+
+        status = "🟢 Открыто" if row["status"] == "open" else "🔒 Закрыто"
 
         await message.answer(
-            f"🆘 У вас открыто обращение "
-            f"№{ticket_numb
+            f"📂 <b>Обращение №{ticket_number(row['id'])}</b>\n"
+            f"Пользователь: <code>{row['user_id']}</code>\n"
+            f"Статус: {status}",
+            reply_markup=(
+                admin_ticket_keyboard(row["id"])
+                if row["status"] == "open"
+                else None
+            )
+        )
+
+
+@dp.message(Command("ticket"))
+async def admin_ticket_info(message: Message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /ticket 001")
+        return
+
+    ticket_id = int(parts[1])
+
+    ticket = DB.execute(
+        "SELECT * FROM support_tickets WHERE id=?",
+        (ticket_id,)
+    ).fetchone()
+
+    if not ticket:
+        await message.answer("Обращение не найдено.")
+        return
+
+    rows = DB.execute(
+        """
+        SELECT * FROM support_messages
+        WHERE ticket_id=?
+        ORDER BY id DESC LIMIT 15
+        """,
+        (ticket_id,)
+    ).fetchall()
+
+    result = (
+        f"📂 <b>Обращение №{ticket_number(ticket_id)}</b>\n"
+        f"Пользователь: <code>{ticket['user_id']}</code>\n"
+        f"Статус: {ticket['status']}\n\n"
+        "<b>Последние сообщения:</b>\n"
+    )
+
+    for row in reversed(rows):
+
+        sender = (
+            "👤 Пользователь"
+            if row["sender_type"] == "user"
+            else "🛠 Администратор"
+        )
+
+        result += (
+            f"\n{sender}:\n"
+            f"{html.escape(row['message'][:700])}\n"
+        )
+
+    await message.answer(result)
+
+
+@dp.message(Command("reply"))
+async def admin_reply_command(message: Message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = message.text.split(maxsplit=2)
+
+    if len(parts) < 3 or not parts[1].isdigit():
+        await message.answer("Использование: /reply 001 Текст ответа")
+        return
+
+    ticket_id = int(parts[1])
+    text = parts[2]
+
+    ticket = DB.execute(
+        "SELECT * FROM support_tickets WHERE id=?",
+        (ticket_id,)
+    ).fetchone()
+
+    if not ticket or ticket["status"] != "open":
+        await message.answer("Обращение не найдено или закрыто.")
+        return
+
+    try:
+
+        await bot.send_message(
+            ticket["user_id"],
+            f"🛠 <b>Ответ поддержки VEXORA AI</b>\n\n"
+            f"{html.escape(text)}"
+        )
+
+        save_support_message(
+            ticket_id,
+            ADMIN_ID,
+            "admin",
+            text
+        )
+
+        await message.answer("✅ Ответ отправлен!")
+
+    except Exception:
+
+        logging.exception("Ошибка отправки ответа")
+
+        await message.answer(
+            "⚠️ Не удалось отправить сообщение пользователю."
+        )
+
+
+@dp.message(Command("close_ticket"))
+async def admin_close_ticket(message: Message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /close_ticket 001")
+        return
+
