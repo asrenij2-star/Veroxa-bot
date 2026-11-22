@@ -874,4 +874,10 @@ async def admin_close_ticket(message: Message):
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Использование: /close_ticket 001")
         return
+        async def main():
+    logging.info("VEXORA AI запускается...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
